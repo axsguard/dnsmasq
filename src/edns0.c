@@ -518,6 +518,11 @@ static size_t add_umbrella_opt(struct dns_header *header, size_t plen, unsigned 
   return add_pseudoheader(header, plen, (unsigned char *)limit, PACKETSZ, EDNS0_OPTION_UMBRELLA, (unsigned char *)&opt, u - (u8 *)&opt, 0, 1);
 }
 
+static size_t remove_cookie(struct dns_header *header, size_t plen, unsigned char *limit)
+{
+  return add_pseudoheader(header, plen, limit, PACKETSZ, EDNS0_OPTION_COOKIE, NULL, 0, 0, 2);
+}
+
 /* Set *check_subnet if we add a client subnet option, which needs to checked 
    in the reply. Set *cacheable to zero if we add an option which the answer
    may depend on. */
@@ -537,6 +542,8 @@ size_t add_edns0_config(struct dns_header *header, size_t plen, unsigned char *l
     plen = add_umbrella_opt(header, plen, limit, source, cacheable);
   
   plen = add_source_addr(header, plen, limit, source, cacheable);
+
+  plen = remove_cookie(header, plen, limit);
   	  
   return plen;
 }
