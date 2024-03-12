@@ -1255,6 +1255,9 @@ extern struct daemon {
   int back_to_the_future;
   int limit[LIMIT_MAX];
 #endif
+#ifdef HAVE_COOKIE
+  u8 cookie_secret[16];
+#endif
   struct frec *frec_list;
   struct frec_src *free_frec_src;
   int frec_src_count;
