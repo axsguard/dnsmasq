@@ -252,6 +252,36 @@ size_t add_do_bit(struct dns_header *header, size_t plen, unsigned char *limit)
   return add_pseudoheader(header, plen, (unsigned char *)limit, 0, NULL, 0, 1, 0);
 }
 
+size_t add_extended_rcode(struct dns_header *header, size_t plen, unsigned char *limit, unsigned short rcode)
+{
+  unsigned char *p, *udp_len;
+  unsigned short edns_rcode; /* higher bits rcode and version */
+
+  p = find_pseudoheader(header, plen, NULL, &udp_len, NULL, NULL);
+
+  if (p == NULL)
+    {
+      plen = add_pseudoheader(header, plen, (unsigned char *)limit, daemon->edns_pktsz, 0, NULL, 0, 0, 0);
+      p = find_pseudoheader(header, plen, NULL, &udp_len, NULL, NULL);
+    }
+
+  if (p == NULL)
+    return plen;
+
+  p = udp_len + 2;
+
+  GETSHORT(edns_rcode, p);
+
+  /* RFC 2671 */
+  SET_RCODE(header, (rcode & 0xf));
+  edns_rcode |= (rcode << 4) & 0xff00;
+
+  p -= 2;
+  PUTSHORT(edns_rcode, p);
+
+  return plen;
+}
+
 static unsigned char char64(unsigned char c)
 {
   return "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"[c & 0x3f];
