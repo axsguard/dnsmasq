@@ -400,6 +400,24 @@ int sa_len(union mysockaddr *addr)
 #endif
 }
 
+#ifdef HAVE_COOKIE
+void *sa_addr(union mysockaddr *addr)
+{
+  if (addr->sa.sa_family == AF_INET6)
+    return &(addr->in6.sin6_addr);
+  else
+    return &(addr->in.sin_addr);
+}
+
+size_t sa_addr_len(union mysockaddr *addr)
+{
+  if (addr->sa.sa_family == AF_INET6)
+    return sizeof(addr->in6.sin6_addr);
+  else
+    return sizeof(addr->in.sin_addr);
+}
+#endif /* HAVE_COOKIE */
+
 /* don't use strcasecmp and friends here - they may be messed up by LOCALE */
 int hostname_order(const char *a, const char *b)
 {
