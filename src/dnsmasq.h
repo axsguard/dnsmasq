@@ -1471,6 +1471,10 @@ void safe_pipe(int *fd, int read_noblock);
 void *whine_malloc(size_t size);
 void *whine_realloc(void *ptr, size_t size);
 int sa_len(union mysockaddr *addr);
+#ifdef HAVE_COOKIE
+void *sa_addr(union mysockaddr *addr);
+size_t sa_addr_len(union mysockaddr *addr);
+#endif
 int sockaddr_isequal(const union mysockaddr *s1, const union mysockaddr *s2);
 int sockaddr_isnull(const union mysockaddr *s);
 int hostname_order(const char *a, const char *b);
