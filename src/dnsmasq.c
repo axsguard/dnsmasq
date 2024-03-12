@@ -39,6 +39,9 @@ static void fatal_event(struct event_desc *ev, char *msg);
 static int read_event(int fd, struct event_desc *evp, char **msg);
 static void poll_resolv(int force, int do_reload, time_t now);
 static void tcp_init(void);
+#ifdef HAVE_COOKIE
+static void cookie_init(void);
+#endif
 
 int main (int argc, char **argv)
 {
@@ -106,6 +109,10 @@ int main (int argc, char **argv)
   rand_init(); /* Must precede read_opts() */
   
   read_opts(argc, argv, compile_opts);
+
+#ifdef HAVE_COOKIE
+  cookie_init();
+#endif
  
 #ifdef HAVE_LINUX_NETWORK
   daemon->kernel_version = kernel_version();
@@ -2416,3 +2423,20 @@ void tcp_init(void)
   daemon->tcp_pids = safe_malloc(daemon->max_procs*sizeof(pid_t));
   daemon->tcp_pipes = safe_malloc(daemon->max_procs*sizeof(int));
 }
+
+#ifdef HAVE_COOKIE
+static void cookie_init(void)
+{
+  int i;
+
+  for (i = 0; i < 16; i += 4)
+    {
+      u32 rnd = rand32();
+
+      daemon->cookie_secret[i]   = (rnd >> 24) & 0xff;
+      daemon->cookie_secret[i+1] = (rnd >> 16) & 0xff;
+      daemon->cookie_secret[i+2] = (rnd >>  8) & 0xff;
+      daemon->cookie_secret[i+3] = (rnd & 0xff);
+    }
+}
+#endif /* HAVE_COOKIE */
