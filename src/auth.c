@@ -116,6 +116,7 @@ size_t answer_auth(struct dns_header *header, char *limit, size_t qlen, time_t n
   union all_addr addr;
   struct cname *a, *candidate;
   unsigned int wclen;
+  size_t len;
   
   if (ntohs(header->qdcount) == 0 || OPCODE(header) != QUERY )
     return 0;
@@ -879,6 +880,8 @@ size_t answer_auth(struct dns_header *header, char *limit, size_t qlen, time_t n
   header->nscount = htons(authcount);
   header->arcount = htons(0);
 
+  len = ansp - (unsigned char *)header;
+
   if (!local_query && out_of_zone)
     {
       SET_RCODE(header, REFUSED); 
@@ -886,15 +889,23 @@ size_t answer_auth(struct dns_header *header, char *limit, size_t qlen, time_t n
       header->nscount = htons(0);
       addr.log.rcode = REFUSED;
       addr.log.ede = EDE_NOT_AUTH;
+#ifdef HAVE_COOKIE
+      len = add_cookie(header, len, (unsigned char *)limit, daemon->cookie_secret, &daemon->cookie_info);
+#endif
       log_query(F_UPSTREAM | F_RCODE, "error", &addr, NULL, 0);
-      return resize_packet(header,  ansp - (unsigned char *)header, NULL, 0);
+      return resize_packet(header, len, NULL, 0);
     }
   
   /* Advertise our packet size limit in our reply */
   if (have_pseudoheader)
-    return add_pseudoheader(header,  ansp - (unsigned char *)header, (unsigned char *)limit, daemon->edns_pktsz, 0, NULL, 0, do_bit, 0);
+    {
+      len = add_pseudoheader(header, len, (unsigned char *)limit, daemon->edns_pktsz, 0, NULL, 0, do_bit, 0);
+#ifdef HAVE_COOKIE
+      len = add_cookie(header, len, (unsigned char *)limit, daemon->cookie_secret, &daemon->cookie_info);
+#endif
+    }
 
-  return ansp - (unsigned char *)header;
+  return len;
 }
   
 #endif  

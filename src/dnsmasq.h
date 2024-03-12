@@ -547,6 +547,48 @@ union mysockaddr {
 #define IFACE_DEPRECATED  2
 #define IFACE_PERMANENT   4
 
+/* DNS cookies */
+#ifdef HAVE_COOKIE
+struct cookie {
+  u8 client[8];
+  /* rfc9018 : 128-bits server cookie */
+  union {
+    u8 server[16];
+    struct {
+      u8 version;
+      u8 z[3];
+      uint32_t timestamp;
+      u8 hash[8];
+    } server_v1_16; /* version 1, size 16, method SipHash-2-4 */
+  };
+};
+
+struct cookie_info {
+  union mysockaddr *ip;
+  time_t time;
+  unsigned short flags;
+  struct cookie cookie;
+};
+
+#define COOKIE_F_NONE       0
+#define COOKIE_F_MALFORMED  1
+#define COOKIE_F_EXPIRING   2
+#define COOKIE_F_EXPIRED    4
+#define COOKIE_F_INVALID    8
+#define COOKIE_F_CLIENT    16
+#define COOKIE_F_SERVER    32
+
+#define HAS_CLIENT_COOKIE(c) ((c)->flags & COOKIE_F_CLIENT)
+#define HAS_COOKIE(c) (HAS_CLIENT_COOKIE(c) && ((c)->flags & COOKIE_F_SERVER))
+#define HAS_NO_COOKIE(c) ((c)->flags == COOKIE_F_NONE)
+
+#define IS_MALFORMED_COOKIE(c) ((c)->flags & COOKIE_F_MALFORMED)
+#define IS_BAD_COOKIE(c) ((c)->flags & (COOKIE_F_EXPIRED | COOKIE_F_INVALID))
+#define IS_EXPIRING_COOKIE(c) ((c)->flags & COOKIE_F_EXPIRING)
+#define IS_VALID_COOKIE(c) \
+  (HAS_COOKIE(c) && !(IS_MALFORMED_COOKIE(c) || IS_BAD_COOKIE(c)))
+
+#endif /* HAVE_COOKIE */
 
 /* The actual values here matter, since we sort on them to get records in the order
    IPv6 addr, IPv4 addr, all zero return, resolvconf servers, upstream server, no-data return  */
@@ -784,6 +826,9 @@ struct frec {
     unsigned int iface, log_id;
     int fd;
     unsigned short orig_id;
+#ifdef HAVE_COOKIE
+    struct cookie_info cookie_info;
+#endif
     struct frec_src *next;
   } frec_src;
   struct server *sentto; /* NULL means free */
@@ -1252,6 +1297,7 @@ extern struct daemon {
   int limit[LIMIT_MAX];
 #endif
 #ifdef HAVE_COOKIE
+  struct cookie_info cookie_info;
   u8 cookie_secret[16];
 #endif
   struct frec *frec_list;
@@ -1877,6 +1923,12 @@ size_t add_extended_rcode(struct dns_header *header, size_t plen, unsigned char 
 size_t add_edns0_config(struct dns_header *header, size_t plen, unsigned char *limit, 
 			union mysockaddr *source, time_t now, int *cacheable);
 int check_source(struct dns_header *header, size_t plen, unsigned char *pseudoheader, union mysockaddr *peer);
+#ifdef HAVE_COOKIE
+int check_cookie(struct dns_header *header, size_t plen, unsigned char *limit, u8 *secret, struct cookie_info *ci);
+size_t add_cookie(struct dns_header *header, size_t plen, unsigned char *limit, u8 *secret, struct cookie_info *ci);
+
+int siphash(const void *in, const size_t inlen, const void *k, uint8_t *out, const size_t outlen);
+#endif /* HAVE_COOKIE */
 
 /* arp.c */
 int find_mac(union mysockaddr *addr, unsigned char *mac, int lazy, time_t now);

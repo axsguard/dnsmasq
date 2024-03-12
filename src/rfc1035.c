@@ -2344,7 +2344,12 @@ size_t answer_request(struct dns_header *header, char *limit, size_t qlen,
   
   /* Advertise our packet size limit in our reply */
   if (have_pseudoheader)
-    len = add_pseudoheader(header, len, (unsigned char *)limit, daemon->edns_pktsz, 0, NULL, 0, do_bit, 0);
+    {
+      len = add_pseudoheader(header, len, (unsigned char *)limit, daemon->edns_pktsz, 0, NULL, 0, do_bit, 0);
+#ifdef HAVE_COOKIE
+      len = add_cookie(header, len, (unsigned char *)limit, daemon->cookie_secret, &daemon->cookie_info);
+#endif
+    }
   
   if (ad_reqd && sec_data)
     header->hb4 |= HB4_AD;

@@ -87,6 +87,10 @@ objs = cache.o rfc1035.o util.o option.o forward.o network.o \
        poll.o rrfilter.o edns0.o arp.o crypto.o dump.o ubus.o \
        metrics.o hash-questions.o domain-match.o nftset.o
 
+ifneq ($(findstring HAVE_COOKIE,$(COPTS)),)
+objs += siphash.o
+endif
+
 hdrs = dnsmasq.h config.h dhcp-protocol.h dhcp6-protocol.h \
        dns-protocol.h radv-protocol.h ip6addr.h metrics.h
 

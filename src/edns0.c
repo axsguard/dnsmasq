@@ -553,6 +553,180 @@ static size_t remove_cookie(struct dns_header *header, size_t plen, unsigned cha
   return add_pseudoheader(header, plen, limit, PACKETSZ, EDNS0_OPTION_COOKIE, NULL, 0, 0, 2);
 }
 
+#ifdef HAVE_COOKIE
+int check_cookie(struct dns_header *header, size_t plen, unsigned char* limit,
+                 u8 *secret, struct cookie_info *ci)
+{
+  uint8_t hash_in[32];
+  uint32_t c_ts;
+  unsigned char *p;
+  int i;
+
+  ci->flags = COOKIE_F_NONE;
+
+  if (!(p = skip_questions(header, plen)) ||
+      !(p = skip_section(p,
+	  ntohs(header->ancount) + ntohs(header->nscount),
+	  header, plen)))
+    {
+      ci->flags |= COOKIE_F_MALFORMED;
+      return 0;
+    }
+
+  for (i = 0; i < ntohs(header->arcount); ++i)
+    {
+      unsigned short type, rdlen;
+      int j;
+
+      if (p >= limit)
+	break;
+
+      if (!(p = skip_name(p, header, plen, 10)))
+        {
+	  ci->flags |= COOKIE_F_MALFORMED;
+	  return 0;
+	}
+
+      GETSHORT(type, p);
+      p += 6; /* SZ, RCODE, VERSION, Z */
+      GETSHORT(rdlen, p);
+
+      if (type != T_OPT)
+        {
+	  p += rdlen;
+	  continue;
+	}
+
+      /* check if option already there */
+      for (j = 0; j + 4 < rdlen;)
+	{
+	  unsigned short code, len;
+
+	  GETSHORT(code, p);
+	  GETSHORT(len, p);
+
+	  /* malformed option */
+	  if (j + 4 + len > rdlen)
+	    {
+	      ci->flags |= COOKIE_F_MALFORMED;
+	      return 0;
+	    }
+
+	  j += 4 + len;
+	  if (code != EDNS0_OPTION_COOKIE)
+	    {
+	      p += len;
+	      continue;
+	    }
+
+	  if (len != 8 && (len < 16 || len > 40))
+	    {
+	      /* malformed cookie rfc7873 5.2.2 */
+	      ci->flags |= COOKIE_F_MALFORMED;
+	      return 0;
+	    }
+
+	  /* client cookie */
+	  memcpy(ci->cookie.client, p, 8);
+	  ci->flags |= COOKIE_F_CLIENT;
+
+	  if (len == 8)
+	    return 0;
+
+	  if (len != (8+16))
+	    {
+	      /* rfc9018 4 : require 128-bit server cookie */
+	      ci->flags |= COOKIE_F_INVALID;
+	      return 0;
+	    }
+
+	  /* client cookie, version, reserved, timestamp */
+	  memcpy(hash_in, p, 16);
+	  ci->flags |= COOKIE_F_SERVER;
+
+	  p += 8;
+	  if (*p != 1)
+	    {
+	      /* support version 1 only */
+	      ci->flags |= COOKIE_F_INVALID;
+	      return 0;
+	    }
+
+	  memcpy(ci->cookie.server, p, 16);
+
+	  c_ts = ntohl(ci->cookie.server_v1_16.timestamp);
+
+	  if (c_ts > ci->time && c_ts > (ci->time + 300))
+	    {
+	      /* badcookie when more than 5min in the future */
+	      ci->flags |= COOKIE_F_INVALID;
+	      return 0;
+	    }
+
+	  if (c_ts < ci->time && (c_ts + 3600) < ci->time)
+	    {
+	      /* badcookie when more than 1hr in the past */
+	      ci->flags |= COOKIE_F_EXPIRED;
+	      return 0;
+	    }
+
+	  /* new cookie when older than half hour */
+	  if ((c_ts + 1800) < ci->time)
+	    ci->flags |= COOKIE_F_EXPIRING;
+
+	  p += 8;
+
+	  memcpy(&hash_in[16], sa_addr(ci->ip), sa_addr_len(ci->ip));
+
+	  siphash(hash_in, 16 + sa_addr_len(ci->ip), secret, ci->cookie.server_v1_16.hash, 8);
+
+	  /* validate server cookie */
+	  if (memcmp(ci->cookie.server_v1_16.hash, p, 8) == 0)
+	    return 1;
+
+	  ci->flags |= COOKIE_F_INVALID;
+	  /* rfc7873 4.2 all but the first COOKIE options are ignored */
+	  return 0;
+	}
+    }
+
+  return 0;
+}
+
+size_t add_cookie(struct dns_header *header, size_t plen, unsigned char* limit,
+                  u8 *secret, struct cookie_info *ci)
+{
+  uint8_t hash_in[32] = {};
+
+  if (HAS_NO_COOKIE(ci))
+    return plen;
+
+  if (IS_MALFORMED_COOKIE(ci))
+    return plen;
+
+  if (IS_VALID_COOKIE(ci) && ! IS_EXPIRING_COOKIE(ci))
+    return add_pseudoheader(header, plen, limit, PACKETSZ,
+			    EDNS0_OPTION_COOKIE, (unsigned char*)&ci->cookie, 24, 0, 1);
+
+  /* version */
+  ci->cookie.server_v1_16.version = 1;
+  /* reserved 2, 3, 4 */
+  memset(ci->cookie.server_v1_16.z, 0, 3);
+  /* timestamp in nw byte order */
+  ci->cookie.server_v1_16.timestamp = htonl(ci->time);
+
+  /* calculate hash */
+  memcpy(hash_in, &ci->cookie, 16);
+  memcpy(&hash_in[16], sa_addr(ci->ip), sa_addr_len(ci->ip));
+
+  /* append hash */
+  siphash(hash_in, 16 + sa_addr_len(ci->ip), secret, ci->cookie.server_v1_16.hash, 8);
+
+  return add_pseudoheader(header, plen, limit, PACKETSZ,
+			  EDNS0_OPTION_COOKIE, (unsigned char*)&ci->cookie, 24, 0, 1);
+}
+#endif /* HAVE_COOKIE */
+
 /* Set *check_subnet if we add a client subnet option, which needs to checked 
    in the reply. Set *cacheable to zero if we add an option which the answer
    may depend on. */
