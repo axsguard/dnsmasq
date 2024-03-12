@@ -132,6 +132,9 @@ HAVE_AUTH
 HAVE_DNSSEC
    include DNSSEC validator.
 
+HAVE_COOKIE
+   support DNS Cookies
+
 HAVE_DUMPFILE
    include code to dump packets to a libpcap-format file for debugging.
 
@@ -443,6 +446,10 @@ static char *compile_opts =
 "no-"
 #endif
 "DNSSEC "
+#ifndef HAVE_COOKIE
+"no-"
+#endif
+"cookie "
 #ifdef NO_ID
 "no-ID "
 #endif
