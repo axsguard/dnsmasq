@@ -163,6 +163,75 @@ static int domain_no_rebind(char *domain)
   return 0;
 }
 
+#ifdef HAVE_COOKIE
+static size_t answer_cookie(struct dns_header *header, unsigned char *limit, size_t qlen,
+			    time_t now, union mysockaddr *peer_addr, int is_tcp)
+{
+  unsigned short rcode = NOERROR, qs = 0;
+  unsigned char *p;
+
+  daemon->cookie_info.ip = peer_addr;
+  daemon->cookie_info.time = now;
+  check_cookie(header, qlen, limit, daemon->cookie_secret, &daemon->cookie_info);
+
+  /* rfc7873 5.2.2 malformed cookie */
+  if (IS_MALFORMED_COOKIE(&daemon->cookie_info))
+    rcode = FORMERR;
+  /* rfc7873 5.4 querying a server cookie */
+  else if (ntohs(header->qdcount) == 0 &&
+	   OPCODE(header) == QUERY &&
+	   HAS_CLIENT_COOKIE(&daemon->cookie_info))
+    /* a client and/or server cookie is present */
+    qs = 1;
+  /* rfc7873 5.2.3 only a client cookie */
+  else if (OPCODE(header) == QUERY &&
+	   HAS_CLIENT_COOKIE(&daemon->cookie_info) &&
+	   !HAS_COOKIE(&daemon->cookie_info)) {
+    /* with UDP: 2 - bad cookie */
+    if (!is_tcp)
+      rcode = BADCOOKIE;
+    /* with TCP: 3 - normal answer */
+  }
+  /* rfc7873 5.2.4 client cookie and invalid server cookie */
+  else if (OPCODE(header) == QUERY &&
+	   HAS_COOKIE(&daemon->cookie_info) &&
+	   !IS_VALID_COOKIE(&daemon->cookie_info)) {
+    /* with UDP: 2 - bad cookie */
+    if (!is_tcp)
+      rcode = BADCOOKIE;
+    /* with TCP: 3 - normal answer */
+  }
+  /* rfc7873 5.2.5 - client cookie and valid server cookie - normal answer */
+  else if (OPCODE(header) == QUERY &&
+	   HAS_COOKIE(&daemon->cookie_info) &&
+	   IS_VALID_COOKIE(&daemon->cookie_info)) {}
+  /* catch all bad */
+  else if (IS_BAD_COOKIE(&daemon->cookie_info))
+    rcode = BADCOOKIE;
+  /* rfc7873 5.2.1 no opt RR or no cookie */
+
+  if (rcode != NOERROR || qs)
+    {
+      setup_reply(header, F_NOERR, EDE_UNSET);
+
+      if (!(p = skip_questions(header, qlen)))
+	return 0;
+
+      qlen = p - (unsigned char *)header;
+
+      if (rcode > 0xf)
+	qlen = add_extended_rcode(header, qlen, limit, rcode);
+      else
+	SET_RCODE(header, rcode);
+
+      return add_cookie(header, qlen, limit,
+			daemon->cookie_secret, &daemon->cookie_info);
+    }
+
+  return 0;
+}
+#endif
+
 static void forward_query(int udpfd, union mysockaddr *udpaddr,
 			  union all_addr *dst_addr, unsigned int dst_iface,
 			  struct dns_header *header, size_t plen,  size_t replylimit, time_t now, 
@@ -314,6 +383,10 @@ static void forward_query(int udpfd, union mysockaddr *udpaddr,
 	  src->encode_bigmap = bitvector;
 	  
 	  src->udp_pkt_size = (unsigned short)replylimit;
+#ifdef HAVE_COOKIE
+	  memcpy(&src->cookie_info, &daemon->cookie_info, sizeof(struct cookie_info));
+	  src->cookie_info.ip = &src->source;
+#endif
 
 	  /* closely spaced identical queries cannot be a try and a retry, so
 	     it's safe to wait for the reply from the first without
@@ -412,6 +485,10 @@ static void forward_query(int udpfd, union mysockaddr *udpaddr,
       forward->frec_src.next = NULL;
       forward->frec_src.fd = udpfd;
       forward->frec_src.udp_pkt_size = (unsigned short)replylimit;
+#ifdef HAVE_COOKIE
+      memcpy(&forward->frec_src.cookie_info, &daemon->cookie_info, sizeof(struct cookie_info));
+      forward->frec_src.cookie_info.ip = &forward->frec_src.source;
+#endif
       forward->forwardall = 0;
       if (domain_no_rebind(daemon->namebuff))
 	forward->flags |= FREC_NOREBIND;
@@ -603,6 +680,9 @@ static void forward_query(int udpfd, union mysockaddr *udpaddr,
 	    plen = add_pseudoheader(header, plen, (unsigned char *)(header + replylimit), EDNS0_OPTION_EDE, (unsigned char *)&swap, 2, 0, 0);
 	  else
 	    plen = add_pseudoheader(header, plen, (unsigned char *)(header + replylimit), 0, NULL, 0, 0, 0);
+#ifdef HAVE_COOKIE
+	  plen = add_cookie(header, plen, (unsigned char *)(header + replylimit), daemon->cookie_secret, &daemon->cookie_info);
+#endif
 	}
       
 #if defined(HAVE_CONNTRACK) && defined(HAVE_UBUS)
@@ -1454,6 +1534,10 @@ void return_reply(time_t now, struct frec *forward, struct dns_header *header, s
 	  
 	  if (src->fd != -1)
 	    {
+#ifdef HAVE_COOKIE
+	      nn = add_cookie(header, nn, ((unsigned char *)header) + src->udp_pkt_size,
+			      daemon->cookie_secret, &src->cookie_info);
+#endif
 	      /* Only send packets that fit what the requestor allows.
 		 We'll send a truncated packet to others below. */
 	      if (nn <= src->udp_pkt_size)
@@ -1895,6 +1979,24 @@ void receive_query(struct listener *listen, time_t now)
     fwd_flags |= FREC_CHECKING_DISABLED;
 
   fd = listen->fd;
+
+#ifdef HAVE_COOKIE
+  m = answer_cookie(header, ((unsigned char *)header) + udp_size,
+		    (size_t)n, now, &source_addr, 0);
+
+  if (m != 0)
+    {
+#ifdef HAVE_DUMPFILE
+      dump_packet_udp(DUMP_REPLY, daemon->packet, m, NULL, &source_addr, listen->fd);
+#endif
+      send_from(listen->fd, option_bool(OPT_NOWILD) || option_bool(OPT_CLEVERBIND),
+	  (char *)header, m, &source_addr, &dst_addr, if_index);
+      daemon->metrics[METRIC_DNS_LOCAL_ANSWERED]++;
+      return;
+    }
+
+  /* NO or GOOD cookie, continue as normal */
+#endif
   
 #ifdef HAVE_CONNTRACK
 #ifdef HAVE_AUTH
@@ -1969,6 +2071,10 @@ void receive_query(struct listener *listen, time_t now)
 	  else
 	    m = add_pseudoheader(header,  m,  ((unsigned char *) header) + daemon->edns_pktsz,
 				 0, NULL, 0, do_bit, 0);
+#ifdef HAVE_COOKIE
+	  m = add_cookie(header, m, ((unsigned char *)header) + daemon->edns_pktsz,
+			 daemon->cookie_secret, &daemon->cookie_info);
+#endif
 	}
   
 #ifdef HAVE_DUMPFILE
@@ -2474,13 +2580,6 @@ unsigned char *tcp_request(int confd, time_t now,
 	    ede = EDE_INVALID_DATA;
 	  else
 	    {
-	      if (saved_question)
-		blockdata_free(saved_question);
-	      
-	      size = add_edns0_config(header, size, ((unsigned char *) header) + 65536, &peer_addr, now, &cacheable);
-	      saved_question = blockdata_alloc((char *)header, (size_t)size);
-	      saved_size = size;
-	      
 	      log_query_mysockaddr(F_QUERY | F_FORWARD, daemon->namebuff,
 				   &peer_addr, auth_dns ? "auth" : "query", qtype);
 	      
@@ -2534,6 +2633,15 @@ unsigned char *tcp_request(int confd, time_t now,
 	      if (header->hb4 & HB4_AD)
 		ad_reqd = 1;
 
+#ifdef HAVE_COOKIE
+	      m = answer_cookie(header, ((unsigned char *)header) + 65536,
+				(size_t)size, now, &peer_addr, 1);
+
+	      if (m != 0)
+		goto tcp_request_reply;
+
+	      /* NO or GOOD cookie, continue as normal */
+#endif
 #ifdef HAVE_CONNTRACK
 #ifdef HAVE_AUTH
 	      if (!auth_dns || local_auth)
@@ -2554,9 +2662,17 @@ unsigned char *tcp_request(int confd, time_t now,
 	      else if (auth_dns)
 		m = answer_auth(header, ((char *) header) + 65536, (size_t)size, now, &peer_addr, local_auth);
 #endif
-	      else
+	      else {
+		if (saved_question)
+		  blockdata_free(saved_question);
+
+		size = add_edns0_config(header, size, ((unsigned char *) header) + 65536, &peer_addr, now, &cacheable);
+		saved_question = blockdata_alloc((char *)header, (size_t)size);
+		saved_size = size;
+
 		m = answer_request(header, ((char *) header) + 65536, (size_t)size, 
 				   dst_addr_4, netmask, now, ad_reqd, do_bit, !cacheable, &stale, &filtered);
+	      }
 	    }
 	}
       
@@ -2692,6 +2808,10 @@ unsigned char *tcp_request(int confd, time_t now,
 					option_bool(OPT_NO_REBIND) && !norebind, no_cache_dnssec, cache_secure, bogusanswer,
 					ad_reqd, do_bit, !have_pseudoheader, &peer_addr, ((unsigned char *)header) + 65536, ede);
 
+#ifdef HAVE_COOKIE
+		      if (m > 0)
+			m = add_cookie(header, m, ((unsigned char *)header) + 65536, daemon->cookie_secret, &daemon->cookie_info);
+#endif
 		      /* process_reply() adds pheader itself */
 		      have_pseudoheader = 0; 
 		    }
@@ -2699,6 +2819,9 @@ unsigned char *tcp_request(int confd, time_t now,
 	    }
 	}
 
+#ifdef HAVE_COOKIE
+tcp_request_reply:
+#endif
       if (do_stale)
 	break;
       
@@ -2725,6 +2848,9 @@ unsigned char *tcp_request(int confd, time_t now,
 	    m = add_pseudoheader(header, m, ((unsigned char *) header) + 65536, EDNS0_OPTION_EDE, (unsigned char *)&swap, 2, do_bit, 0);
 	  else
 	    m = add_pseudoheader(header, m, ((unsigned char *) header) + 65536, 0, NULL, 0, do_bit, 0);
+#ifdef HAVE_COOKIE
+	  m = add_cookie(header, m, ((unsigned char *)header) + 65536, daemon->cookie_secret, &daemon->cookie_info);
+#endif
 	}
 		  
       check_log_writer(1);
