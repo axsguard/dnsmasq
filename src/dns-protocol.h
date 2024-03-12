@@ -33,6 +33,7 @@
 #define NXDOMAIN	3		/* non existent domain */
 #define NOTIMP		4		/* not implemented */
 #define REFUSED		5		/* query refused */
+#define BADCOOKIE 	23 		/* bad/missing server cookie */
 
 #define QUERY           0               /* opcode */
 
