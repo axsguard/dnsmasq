@@ -215,6 +215,39 @@ static size_t answer_cookie(struct dns_header *header, char *limit, size_t qlen,
 
   return 0;
 }
+
+static size_t forward_cookie(struct dns_header *header, size_t plen, char *limit, time_t now, struct server *srv)
+{
+  int i;
+
+  if ((HAS_NO_COOKIE(&srv->cookie_info) &&
+	(srv->cookie_info.time == 0 ||
+	 /* rfc9018 3. recommended 5 min timeout for a server not supporting cookies */
+	 (srv->cookie_info.time + 300) < now)) ||
+      !sockaddr_isequal(srv->cookie_info.ip, &srv->source_addr))
+    {
+      /* rfc9018 3. generate client cookie with 64-bits entropy */
+      for (i = 0; i < 8; i += 2)
+      {
+	u16 rnd = rand16();
+
+	srv->cookie_info.cookie.client[i]   = (rnd >> 8) & 0xff;
+	srv->cookie_info.cookie.client[i+1] = (rnd & 0xff);
+      }
+
+      /* reset flags to (only) client cookie */
+      srv->cookie_info.flags = COOKIE_F_CLIENT;
+      srv->cookie_info.time = now;
+      srv->cookie_info.size = 8;
+      memcpy(srv->cookie_info.ip, &srv->source_addr, sizeof(union mysockaddr));
+    }
+
+  if (IS_VALID_COOKIE(&srv->cookie_info) ||
+      HAS_CLIENT_COOKIE(&srv->cookie_info))
+    return add_cookie(header, plen, (unsigned char *)limit, NULL, &srv->cookie_info);
+
+  return plen;
+}
 #endif
 
 static int forward_query(int udpfd, union mysockaddr *udpaddr,
@@ -578,6 +611,10 @@ static int forward_query(int udpfd, union mysockaddr *udpaddr,
 		PUTSHORT(srv->edns_pktsz, pheader);
 	    }
 #endif
+
+#ifdef HAVE_COOKIE
+	  plen = forward_cookie(header, plen, limit, now, srv);
+#endif
 	  
 	  if (retry_send(sendto(fd, (char *)header, plen, 0,
 				&srv->addr.sa,
@@ -823,6 +860,14 @@ static size_t process_reply(struct dns_header *header, time_t now, struct server
   if (OPCODE(header) != QUERY)
     return resize_packet(header, n, pheader, plen);
 
+#ifdef HAVE_COOKIE
+  if (rcode == BADCOOKIE)
+    {
+      /* rfc7873 5.3 discard too many bad cookies */
+      my_syslog(LOG_WARNING, _("discarding DNS reply: bad cookie"));
+      return 0;
+    }
+#endif
   if (rcode != NOERROR && rcode != NXDOMAIN)
     {
       union all_addr a;
@@ -1181,7 +1226,11 @@ void reply_query(int fd, time_t now)
   ssize_t n = recvfrom(fd, daemon->packet, daemon->packet_buff_sz, 0, &serveraddr.sa, &addrlen);
   struct server *server;
   void *hash;
-  int first, last, c;
+  int first, last, c, fast_retry = 0;
+  unsigned char *pheader, *udpsz;
+  unsigned short rcode, udp_size =  PACKETSZ; /* default if no EDNS0 */
+  size_t plen;
+  int is_sign;
     
   /* packet buffer overwritten */
   daemon->srv_save = NULL;
@@ -1212,7 +1261,12 @@ void reply_query(int fd, time_t now)
 
   server = daemon->serverarray[c];
 
-  if (RCODE(header) != REFUSED)
+  rcode = RCODE(header);
+  if ((pheader = find_pseudoheader(header, (size_t)n, &plen, &udpsz, &is_sign, NULL)))
+      /* Get extended RCODE. */
+      rcode |= udpsz[2] << 4;
+
+  if (rcode != REFUSED)
     daemon->serverarray[first]->last_server = c;
   else if (daemon->serverarray[first]->last_server == c)
     daemon->serverarray[first]->last_server = -1;
@@ -1231,21 +1285,89 @@ void reply_query(int fd, time_t now)
 		  (void *)header, n, &serveraddr, NULL, fd);
 #endif
 
-  if (daemon->ignore_addr && RCODE(header) == NOERROR &&
+  if (daemon->ignore_addr && rcode == NOERROR &&
       check_for_ignored_address(header, n))
     return;
+
+#ifdef HAVE_COOKIE
+  if (pheader)
+    {
+      struct cookie_info cookie_info = {};
+
+      cookie_info.ip = server->cookie_info.ip;
+      cookie_info.time = now;
+
+      if (check_cookie(header, (size_t)n, ((unsigned char *)header) + n,
+		       server->cookie_info.cookie.client, &cookie_info))
+	{
+	  /* server cookie may have been updated */
+	  if (memcmp(&server->cookie_info.cookie,
+		     &cookie_info.cookie,
+		     sizeof(struct cookie)) != 0)
+	    {
+	      memcpy(&server->cookie_info.cookie,
+		     &cookie_info.cookie, sizeof(struct cookie));
+	      server->cookie_info.time = now;
+	      server->cookie_info.size = cookie_info.size;
+	    }
+	  server->cookie_info.flags = cookie_info.flags;
+	}
+      else if (HAS_CLIENT_COOKIE(&cookie_info))
+	{
+	  /* rfc7873 5.3 client cookie invalid - discard */
+	  log_query_mysockaddr(F_SERVER | F_FORWARD, "query-response", &server->addr, "bad cookie", 0);
+	  return;
+	}
+      else if (HAS_COOKIE(&server->cookie_info))
+	{
+	  /* rfc7873 5.3 cookie missing - discard */
+	  log_query_mysockaddr(F_SERVER | F_FORWARD, "query-response", &server->addr, "missing cookie", 0);
+	  return;
+	}
+      else if (!HAS_NO_COOKIE(&server->cookie_info))
+	{
+	  /* no (server) cookie in reply */
+	  server->cookie_info.flags = COOKIE_F_NONE;
+	  server->cookie_info.time = now;
+	  server->cookie_info.size = 0;
+	}
+    }
+
+  if (rcode == BADCOOKIE &&
+      HAS_COOKIE(&server->cookie_info))
+    {
+      if (server->cookie_retry == 0)
+	{
+	  /* rfc7873 5.3 fast retry query with good cookie */
+	  forward->forwardall = 0;
+	  fast_retry = 1;
+	}
+      else if (server->cookie_retry == 1)
+	{
+	  /* TODO rfc7873 5.3 retry query in TCP mode */
+	}
+      else
+	{
+	  /* rfc7873 5.3 too many retries - discard */
+	}
+
+      server->cookie_retry += 1;
+    }
+  else if (rcode != BADCOOKIE)
+    server->cookie_retry = 0;
+#endif
   
   /* Note: if we send extra options in the EDNS0 header, we can't recreate
      the query from the reply. */
-  if ((RCODE(header) == REFUSED || RCODE(header) == SERVFAIL) &&
+  if ((rcode == REFUSED ||
+#ifdef HAVE_COOKIE
+	rcode == BADCOOKIE ||
+#endif
+	rcode == SERVFAIL) &&
       forward->forwardall == 0 &&
       !(forward->flags & FREC_HAS_EXTRADATA))
     /* for broken servers, attempt to send to another one. */
     {
-      unsigned char *pheader, *udpsz;
-      unsigned short udp_size =  PACKETSZ; /* default if no EDNS0 */
-      size_t plen;
-      int is_sign;
       size_t nn = 0;
       
 #ifdef HAVE_DNSSEC
@@ -1277,7 +1399,7 @@ void reply_query(int fd, time_t now)
 	  else
 	    {
 	      /* recreate query from reply */
-	      if ((pheader = find_pseudoheader(header, (size_t)n, &plen, &udpsz, &is_sign, NULL)))
+	      if (pheader)
 		GETSHORT(udp_size, udpsz);
 	      
 	      /* If the client provides an EDNS0 UDP size, use that to limit our reply.
@@ -1308,7 +1430,7 @@ void reply_query(int fd, time_t now)
       if (nn)
 	{
 	  forward_query(-1, NULL, NULL, 0, header, nn, ((char *) header) + udp_size, now, forward,
-			forward->flags & FREC_AD_QUESTION, forward->flags & FREC_DO_QUESTION, 0);
+			forward->flags & FREC_AD_QUESTION, forward->flags & FREC_DO_QUESTION, fast_retry);
 	  return;
 	}
     }
@@ -2038,6 +2160,10 @@ static ssize_t tcp_talk(int first, int last, int start, unsigned char *packet,  
 	}
       
       serv = daemon->serverarray[start];
+
+#ifdef HAVE_COOKIE
+      qsize = forward_cookie(header, qsize, ((char *)header) + 65536, time(NULL), serv);
+#endif
       
     retry:
       *length = htons(qsize);
@@ -2057,6 +2183,12 @@ static ssize_t tcp_talk(int first, int last, int start, unsigned char *packet,  
 	    {
 	      close(serv->tcpfd);
 	      serv->tcpfd = -1;
+#ifdef HAVE_COOKIE
+	      /* rfc9018 3. Failure to bind MUST then result in a new Client Cookie */
+	      serv->cookie_info.flags = COOKIE_F_NONE;
+	      serv->cookie_info.time = 0;
+	      serv->cookie_info.size = 0;
+#endif
 	      continue;
 	    }
 

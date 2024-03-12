@@ -589,6 +589,9 @@ void mark_servers(int flag)
 	  {
 	    *up = next;
 	    free(serv->domain);
+#ifdef HAVE_COOKIE
+	    free(serv->cookie_info.ip);
+#endif
 	    free(serv);
 	  }
 	else 
@@ -609,6 +612,9 @@ void cleanup_servers(void)
          server_gone(serv);
          *up = serv->next;
 	 free(serv->domain);
+#ifdef HAVE_COOKIE
+	 free(serv->cookie_info.ip);
+#endif
 	 free(serv);
        }
       else 
@@ -720,6 +726,15 @@ int add_update_server(int flags,
 	    }
 	  
 	  memset(serv, 0, sizeof(struct server));
+
+#ifdef HAVE_COOKIE
+	  if (!(serv->cookie_info.ip = whine_malloc(sizeof(union mysockaddr))))
+	    {
+	      free(alloc_domain);
+	      free(serv);
+	      return 0;
+	    }
+#endif
 	  
 	  /* Add to the end of the chain, for order */
 	  if (daemon->servers_tail)
@@ -739,6 +754,9 @@ int add_update_server(int flags,
 	serv->addr = *addr;
       if (source_addr)
 	serv->source_addr = *source_addr;
+#ifdef HAVE_COOKIE
+      memcpy(serv->cookie_info.ip, &serv->source_addr, sizeof(union mysockaddr));
+#endif
     }
     
   serv->flags = flags;
