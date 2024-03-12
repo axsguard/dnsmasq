@@ -550,10 +550,12 @@ union mysockaddr {
 /* DNS cookies */
 #ifdef HAVE_COOKIE
 struct cookie {
+  /* rfc9018 4. 64-bits client cookie */
   u8 client[8];
-  /* rfc9018 : 128-bits server cookie */
+  /* rfc9018 7. 8-32 bytes server cookie */
   union {
-    u8 server[16];
+    u8 server[32];
+    /* rfc9018 4. 128-bits server cookie */
     struct {
       u8 version;
       u8 z[3];
@@ -567,6 +569,7 @@ struct cookie_info {
   union mysockaddr *ip;
   time_t time;
   unsigned short flags;
+  u8 size;
   struct cookie cookie;
 };
 
@@ -647,6 +650,10 @@ struct server {
   int forwardcount;
 #ifdef HAVE_LOOP
   u32 uid;
+#endif
+#ifdef HAVE_COOKIE
+  struct cookie_info cookie_info;
+  u8 cookie_retry;
 #endif
 };
 
